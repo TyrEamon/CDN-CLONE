@@ -620,8 +620,8 @@ function parseUserAgentInfo(userAgent = '') {
       ['Clash Meta', /clash.?meta|metacubex/i],
       ['Clash', /\bclash\b/i],
       ['sing-box', /sing-box/i],
-      ['v2rayN', /v2rayn/i],
       ['v2rayNG', /v2rayng/i],
+      ['v2rayN', /v2rayn/i],
       ['NekoBox', /nekobox/i],
       ['Karing', /karing/i]
   ];
@@ -640,6 +640,14 @@ function parseUserAgentInfo(userAgent = '') {
       ['Go HTTP Client', /go-http-client/i],
       ['Python Requests', /python-requests/i]
   ];
+  const clientHints = {
+      'Shadowrocket': { osName: 'iOS', deviceType: '手机' },
+      'Quantumult X': { osName: 'iOS', deviceType: '手机' },
+      'Loon': { osName: 'iOS', deviceType: '手机' },
+      'v2rayNG': { osName: 'Android', deviceType: '手机' },
+      'v2rayN': { osName: 'Windows', deviceType: '桌面' },
+      'NekoBox': { osName: 'Android', deviceType: '手机' }
+  };
 
   let browserName = '未知';
   let clientType = '未知';
@@ -662,18 +670,22 @@ function parseUserAgentInfo(userAgent = '') {
       }
   }
 
+  const clientHint = client ? clientHints[client[0]] : null;
+
   let osName = '未知';
   if (/windows/i.test(ua)) osName = 'Windows';
   else if (/android/i.test(ua)) osName = 'Android';
   else if (/iphone|ipad|ipod/i.test(ua)) osName = 'iOS';
   else if (/mac os x|macintosh/i.test(ua)) osName = 'macOS';
   else if (/linux/i.test(ua)) osName = 'Linux';
+  if (osName === '未知' && clientHint?.osName) osName = clientHint.osName;
 
   let deviceType = '未知';
   if (/ipad|tablet/i.test(ua)) deviceType = '平板';
   else if (/mobile|iphone|ipod|android/i.test(ua)) deviceType = '手机';
   else if (osName === 'Windows' || osName === 'macOS' || osName === 'Linux') deviceType = '桌面';
-  else if (clientType === '订阅客户端') deviceType = '客户端';
+  if (deviceType === '未知' && clientHint?.deviceType) deviceType = clientHint.deviceType;
+  else if (deviceType === '未知' && clientType === '订阅客户端') deviceType = '客户端';
 
   if (/bot|crawler|spider|slurp/i.test(ua)) clientType = '机器人';
 
