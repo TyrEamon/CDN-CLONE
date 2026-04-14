@@ -1804,7 +1804,7 @@ function getProxySettingsPageHTML() {
 async function getDashboardPage(domains, ipSources, settings) { 
   const githubSettingsComplete = settings.GITHUB_TOKEN && settings.GITHUB_OWNER && settings.GITHUB_REPO;
 
-  const snippetsUrl = _d([104,116,116,112,115,58,47,47,114,97,119,46,103,105,116,104,117,98,117,115,101,114,99,111,110,116,101,110,116,46,99,111,109,47,99,114,111,119,49,56,55,52,47,67,70,45,68,78,83,45,67,108,111,110,101,47,109,97,105,110,47,83,82,67,47,115,110,105,112,112,101,116,115,46,106,115]);
+  const snippetsUrl = _d([104,116,116,112,115,58,47,47,114,97,119,46,103,105,116,104,117,98,117,115,101,114,99,111,110,116,101,110,116,46,99,111,109,47,84,121,114,69,97,109,111,110,47,67,68,78,45,67,76,79,78,69,47,109,97,105,110,47,115,110,105,112,112,101,116,46,106,115]);
   let snippetsCode = '/* 无法从 GitHub 获取 Snippets 代码。 */';
   try {
       const response = await fetch(snippetsUrl);
