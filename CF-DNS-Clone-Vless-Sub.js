@@ -608,6 +608,100 @@ function buildAccessLogEntry(request, eventType, extra = {}) {
   };
 }
 
+function parseUserAgentInfo(userAgent = '') {
+  const ua = String(userAgent || '');
+
+  const clientChecks = [
+      ['Shadowrocket', /shadowrocket/i],
+      ['Quantumult X', /quantumult/i],
+      ['Surge', /surge/i],
+      ['Stash', /stash/i],
+      ['Loon', /\bloon\b/i],
+      ['Clash Meta', /clash.?meta|metacubex/i],
+      ['Clash', /\bclash\b/i],
+      ['sing-box', /sing-box/i],
+      ['v2rayN', /v2rayn/i],
+      ['v2rayNG', /v2rayng/i],
+      ['NekoBox', /nekobox/i],
+      ['Karing', /karing/i]
+  ];
+  const browserChecks = [
+      ['WeChat', /micromessenger/i],
+      ['Telegram', /telegram/i],
+      ['Microsoft Edge', /edg\//i],
+      ['Chrome', /chrome|crios/i],
+      ['Firefox', /firefox|fxios/i],
+      ['Safari', /safari/i]
+  ];
+  const scriptChecks = [
+      ['curl', /curl/i],
+      ['Wget', /wget/i],
+      ['okhttp', /okhttp/i],
+      ['Go HTTP Client', /go-http-client/i],
+      ['Python Requests', /python-requests/i]
+  ];
+
+  let browserName = '未知';
+  let clientType = '未知';
+
+  const client = clientChecks.find(([, regex]) => regex.test(ua));
+  if (client) {
+      browserName = client[0];
+      clientType = '订阅客户端';
+  } else {
+      const script = scriptChecks.find(([, regex]) => regex.test(ua));
+      if (script) {
+          browserName = script[0];
+          clientType = '脚本/命令行';
+      } else {
+          const browser = browserChecks.find(([, regex]) => regex.test(ua));
+          if (browser) {
+              browserName = browser[0];
+              clientType = '浏览器';
+          }
+      }
+  }
+
+  let osName = '未知';
+  if (/windows/i.test(ua)) osName = 'Windows';
+  else if (/android/i.test(ua)) osName = 'Android';
+  else if (/iphone|ipad|ipod/i.test(ua)) osName = 'iOS';
+  else if (/mac os x|macintosh/i.test(ua)) osName = 'macOS';
+  else if (/linux/i.test(ua)) osName = 'Linux';
+
+  let deviceType = '未知';
+  if (/ipad|tablet/i.test(ua)) deviceType = '平板';
+  else if (/mobile|iphone|ipod|android/i.test(ua)) deviceType = '手机';
+  else if (osName === 'Windows' || osName === 'macOS' || osName === 'Linux') deviceType = '桌面';
+  else if (clientType === '订阅客户端') deviceType = '客户端';
+
+  if (/bot|crawler|spider|slurp/i.test(ua)) clientType = '机器人';
+
+  return {
+      device_type: deviceType,
+      os_name: osName,
+      browser_name: browserName,
+      browser_type: clientType,
+      user_agent_short: ua.slice(0, 160)
+  };
+}
+
+function decorateAccessLogRow(row) {
+  const uaInfo = parseUserAgentInfo(row.user_agent);
+  const eventLabels = {
+      node_list: '拉取节点列表',
+      subscription_convert: '拉取转换订阅',
+      snippet_subscription: 'Snippet订阅',
+      snippet_vless_ws: 'Snippet节点连接',
+      snippet_vless_xhttp: 'Snippet XHTTP连接'
+  };
+  return {
+      ...row,
+      ...uaInfo,
+      event_label: eventLabels[row.event_type] || row.event_type
+  };
+}
+
 async function insertAccessLog(db, entry) {
   await db.prepare(`
       INSERT INTO access_logs (event_type, client_ip, country, colo, host, path, method, user_agent, target)
@@ -663,7 +757,7 @@ async function apiGetAccessLogs(request, db) {
       ORDER BY id DESC
       LIMIT ?
   `).bind(limit).all();
-  return jsonResponse(results);
+  return jsonResponse((results || []).map(decorateAccessLogRow));
 }
 
 async function apiGetAccessStats(request, db) {
@@ -673,6 +767,7 @@ async function apiGetAccessStats(request, db) {
       { key: '30d', modifier: '-30 days' }
   ];
   const stats = {};
+  const subscriptionEvents = "('node_list','subscription_convert')";
 
   for (const window of windows) {
       const row = await db.prepare(`
@@ -680,16 +775,15 @@ async function apiGetAccessStats(request, db) {
               COUNT(*) as request_count,
               COUNT(DISTINCT client_ip) as unique_ips,
               COUNT(DISTINCT client_ip || '|' || COALESCE(user_agent, '')) as unique_ip_user_agents,
-              COUNT(DISTINCT CASE WHEN event_type IN ('snippet_vless_ws', 'snippet_vless_xhttp') THEN client_ip END) as active_node_ips,
-              COUNT(DISTINCT CASE WHEN event_type IN ('node_list', 'subscription_convert', 'snippet_subscription') THEN client_ip END) as subscription_ips
+              COUNT(DISTINCT client_ip) as subscription_ips
           FROM access_logs
           WHERE created_at >= datetime('now', ?)
+            AND event_type IN ${subscriptionEvents}
       `).bind(window.modifier).first();
       stats[window.key] = row || {
           request_count: 0,
           unique_ips: 0,
           unique_ip_user_agents: 0,
-          active_node_ips: 0,
           subscription_ips: 0
       };
   }
@@ -697,13 +791,28 @@ async function apiGetAccessStats(request, db) {
   const { results: topIps } = await db.prepare(`
       SELECT client_ip, country, COUNT(*) as request_count, MAX(created_at) as last_seen
       FROM access_logs
-      WHERE created_at >= datetime('now', '-7 days') AND client_ip != ''
+      WHERE created_at >= datetime('now', '-7 days')
+        AND event_type IN ${subscriptionEvents}
+        AND client_ip != ''
       GROUP BY client_ip, country
       ORDER BY request_count DESC
       LIMIT 20
   `).all();
 
-  return jsonResponse({ windows: stats, topIps });
+  const { results: recentLogs } = await db.prepare(`
+      SELECT id, event_type, client_ip, country, colo, host, path, method, user_agent, target,
+             strftime('%Y-%m-%dT%H:%M:%SZ', created_at) as created_at
+      FROM access_logs
+      WHERE event_type IN ${subscriptionEvents}
+      ORDER BY id DESC
+      LIMIT 100
+  `).all();
+
+  return jsonResponse({
+      windows: stats,
+      topIps,
+      recentLogs: (recentLogs || []).map(decorateAccessLogRow)
+  });
 }
 
 async function handleApiRequest(request, env) {
@@ -1851,12 +1960,16 @@ async function getDashboardPage(domains, ipSources, settings) {
       <div id="page-access-stats" class="page">
           <div class="admin-header"><h2>访问统计</h2><button id="refreshAccessStatsBtn" class="outline">刷新</button></div>
           <article>
-            <p>这里统计的是升级并配置 Snippet 上报后的访问记录。旧用户不需要换订阅，只要继续连接你的 Snippet，就会开始出现在这里。</p>
+            <p>这里统计的是主 Worker 订阅入口的访问记录，包括原始节点列表和 Xray/Clash/Sing-Box/Surge 转换订阅。让用户重新拉订阅后，就能看到 IP、设备、系统和客户端类型。</p>
             <div id="access-stats-summary" class="grid" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));"></div>
           </article>
           <article>
             <h3>最近 7 天活跃 IP</h3>
             <div id="access-top-ips"></div>
+          </article>
+          <article>
+            <h3>最近拉订阅记录</h3>
+            <div id="access-recent-logs"></div>
           </article>
       </div>
       <div id="page-settings" class="page">
@@ -2015,39 +2128,69 @@ function formatAccessTime(value) {
 function renderAccessStats(stats) {
   const summary = document.getElementById('access-stats-summary');
   const topIps = document.getElementById('access-top-ips');
-  if (!summary || !topIps) return;
+  const recentLogs = document.getElementById('access-recent-logs');
+  if (!summary || !topIps || !recentLogs) return;
 
   const windows = stats.windows || {};
   const labels = { '24h': '最近 24 小时', '7d': '最近 7 天', '30d': '最近 30 天' };
   summary.innerHTML = Object.entries(labels).map(([key, label]) => {
       const row = windows[key] || {};
       return '<div class="domain-card" style="grid-template-columns:1fr;gap:.75rem;margin-bottom:0;">' +
-        '<div class="card-col"><strong>' + label + '</strong><span class="domain-cell">节点连接 IP: ' + Number(row.active_node_ips || 0) + '</span></div>' +
-        '<div class="card-col"><span>拉订阅 IP: ' + Number(row.subscription_ips || 0) + '</span><small>全部独立 IP: ' + Number(row.unique_ips || 0) + '，IP+UA: ' + Number(row.unique_ip_user_agents || 0) + '</small></div>' +
+        '<div class="card-col"><strong>' + label + '</strong><span class="domain-cell">拉订阅 IP: ' + Number(row.subscription_ips || 0) + '</span></div>' +
+        '<div class="card-col"><span>请求次数: ' + Number(row.request_count || 0) + '</span><small>IP+设备组合: ' + Number(row.unique_ip_user_agents || 0) + '</small></div>' +
         '</div>';
   }).join('');
 
   const rows = stats.topIps || [];
   if (rows.length === 0) {
-      topIps.innerHTML = '<p>暂无访问记录。配置并部署 Snippet 上报后，这里会开始出现数据。</p>';
+      topIps.innerHTML = '<p>暂无订阅访问记录。用户重新拉订阅后，这里会开始出现数据。</p>';
+  } else {
+      topIps.innerHTML = '<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">' +
+        '<thead><tr><th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">IP</th><th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">国家</th><th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">请求数</th><th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">最后出现</th></tr></thead>' +
+        '<tbody>' + rows.map(row => '<tr>' +
+          '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));font-family:monospace;">' + escapeHtml(row.client_ip) + '</td>' +
+          '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">' + escapeHtml(row.country || '-') + '</td>' +
+          '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">' + Number(row.request_count || 0) + '</td>' +
+          '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">' + escapeHtml(formatAccessTime(row.last_seen)) + '</td>' +
+        '</tr>').join('') + '</tbody></table></div>';
+  }
+
+  const logs = stats.recentLogs || [];
+  if (logs.length === 0) {
+      recentLogs.innerHTML = '<p>暂无最近拉订阅记录。</p>';
       return;
   }
 
-  topIps.innerHTML = '<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">' +
-    '<thead><tr><th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">IP</th><th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">国家</th><th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">请求数</th><th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">最后出现</th></tr></thead>' +
-    '<tbody>' + rows.map(row => '<tr>' +
-      '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));font-family:monospace;">' + escapeHtml(row.client_ip) + '</td>' +
-      '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">' + escapeHtml(row.country || '-') + '</td>' +
-      '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">' + Number(row.request_count || 0) + '</td>' +
-      '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">' + escapeHtml(formatAccessTime(row.last_seen)) + '</td>' +
+  recentLogs.innerHTML = '<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">' +
+    '<thead><tr>' +
+      '<th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">时间</th>' +
+      '<th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">IP</th>' +
+      '<th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">类型</th>' +
+      '<th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">订阅</th>' +
+      '<th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">设备</th>' +
+      '<th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">系统</th>' +
+      '<th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">客户端/浏览器</th>' +
+      '<th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">UA</th>' +
+    '</tr></thead>' +
+    '<tbody>' + logs.map(row => '<tr>' +
+      '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));white-space:nowrap;">' + escapeHtml(formatAccessTime(row.created_at)) + '</td>' +
+      '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));font-family:monospace;white-space:nowrap;">' + escapeHtml(row.client_ip || '-') + '<br><small>' + escapeHtml(row.country || '-') + ' / ' + escapeHtml(row.colo || '-') + '</small></td>' +
+      '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));white-space:nowrap;">' + escapeHtml(row.event_label || row.event_type) + '</td>' +
+      '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));font-family:monospace;white-space:nowrap;">' + escapeHtml(row.target || row.path || '-') + '</td>' +
+      '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));white-space:nowrap;">' + escapeHtml(row.device_type || '-') + '</td>' +
+      '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));white-space:nowrap;">' + escapeHtml(row.os_name || '-') + '</td>' +
+      '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));white-space:nowrap;">' + escapeHtml(row.browser_name || '-') + '<br><small>' + escapeHtml(row.browser_type || '-') + '</small></td>' +
+      '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));min-width:260px;"><small>' + escapeHtml(row.user_agent_short || row.user_agent || '-') + '</small></td>' +
     '</tr>').join('') + '</tbody></table></div>';
 }
 
 async function refreshAccessStats() {
   const summary = document.getElementById('access-stats-summary');
   const topIps = document.getElementById('access-top-ips');
+  const recentLogs = document.getElementById('access-recent-logs');
   if (summary) summary.innerHTML = '<p>正在加载访问统计...</p>';
   if (topIps) topIps.innerHTML = '';
+  if (recentLogs) recentLogs.innerHTML = '';
   try {
       const stats = await apiFetch('/api/access_stats');
       renderAccessStats(stats);
