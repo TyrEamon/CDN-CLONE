@@ -4,8 +4,52 @@ const EXTERNAL_SUB_BASE_URL = 'https://sub.kkii.eu.org';
 const FRONTEND_HTML_URL = 'https://appxzm.github.io/ui.html';
 const PROXY_IPS = ['proxyip.fxxk.dedyn.io'];
 const CONNECTION_TIMEOUT_MS = 5000;
+const SNIPPET_DEBUG_VERSION = 'cdn-clone-original-debug-20260415';
+const DEBUG_PATH = '/__debug';
 
 import { connect } from 'cloudflare:sockets';
+
+function debugHeaders(extra = {}) {
+    return {
+        'X-CDN-Clone-Snippet': SNIPPET_DEBUG_VERSION,
+        'X-CDN-Clone-Source': 'TyrEamon-CDN-CLONE',
+        ...extra
+    };
+}
+
+function withDebugHeaders(response) {
+    const headers = new Headers(response.headers);
+    headers.set('X-CDN-Clone-Snippet', SNIPPET_DEBUG_VERSION);
+    headers.set('X-CDN-Clone-Source', 'TyrEamon-CDN-CLONE');
+    return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers
+    });
+}
+
+function getDebugResponse(request) {
+    const url = new URL(request.url);
+    return new Response(JSON.stringify({
+        ok: true,
+        version: SNIPPET_DEBUG_VERSION,
+        host: url.hostname,
+        path: url.pathname,
+        method: request.method,
+        upgrade: request.headers.get('Upgrade') || '',
+        userAgent: request.headers.get('User-Agent') || '',
+        colo: request.cf?.colo || '',
+        country: request.cf?.country || '',
+        subscriptions: {
+            xray: '/xray',
+            clash: '/clash',
+            singbox: '/singbox',
+            surge: '/surge'
+        }
+    }, null, 2), {
+        headers: debugHeaders({ 'Content-Type': 'application/json;charset=UTF-8' })
+    });
+}
 
 function connectWithTimeout(hostname, port) {
     return Promise.race([
@@ -52,16 +96,19 @@ export default {
                 const pathname = url.pathname.toLowerCase();
                 const userAgent = (request.headers.get('user-agent') || '').toLowerCase();
                 const isClient = /v2ray|clash|sing-box|shadowrocket/i.test(userAgent);
+                if (pathname === DEBUG_PATH) {
+                    return getDebugResponse(request);
+                }
 
                 if (pathname === '/') {
                     if (isClient) {
                         const xrayUrl = `${EXTERNAL_SUB_BASE_URL}/x/${SUB_ID}`;
-                        return fetch(xrayUrl, { headers: { 'User-Agent': userAgent } });
+                        return withDebugHeaders(await fetch(xrayUrl, { headers: { 'User-Agent': userAgent } }));
                     }
                     
                     const frontendResponse = await fetch(FRONTEND_HTML_URL);
                     if (!frontendResponse.ok) {
-                        return new Response('无法获取前端页面', { status: 502 });
+                        return new Response('Frontend fetch failed', { status: 502, headers: debugHeaders() });
                     }
                     let html = await frontendResponse.text();
                     
@@ -154,7 +201,7 @@ export default {
                     `;
 
                     html = html.replace('</body>', `${configScript}</body>`);
-                    return new Response(html, { status: 200, headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+                    return new Response(html, { status: 200, headers: debugHeaders({ 'Content-Type': 'text/html;charset=UTF-8' }) });
                 }
 
                 const subMap = {
@@ -165,14 +212,14 @@ export default {
                 };
 
                 if (subMap[pathname]) {
-                    return fetch(subMap[pathname], { headers: { 'User-Agent': userAgent || 'Cloudflare-Worker-Proxy' } });
+                    return withDebugHeaders(await fetch(subMap[pathname], { headers: { 'User-Agent': userAgent || 'Cloudflare-Worker-Proxy' } }));
                 }
                 
                 if (pathname.startsWith('/https:/') || pathname.startsWith('/http:/')) {
                     return handleAppDownloadRequest(request);
                 }
 
-                return new Response(JSON.stringify(request.cf, null, 2), { status: 200, headers: { 'Content-Type': 'application/json;charset=UTF-8' } });
+                return new Response(JSON.stringify(request.cf, null, 2), { status: 200, headers: debugHeaders({ 'Content-Type': 'application/json;charset=UTF-8' }) });
             }
 
             let socks5Address = '';
@@ -236,7 +283,7 @@ export default {
             });
             
         } catch (err) {
-            return new Response(err.stack || err.toString(), { status: 500 });
+            return new Response(err.stack || err.toString(), { status: 500, headers: debugHeaders() });
         }
     },
 };
@@ -311,12 +358,12 @@ async function handleSPESSWebSocket(request, config) {
         close: () => remoteSocket?.close(),
     })).catch(() => remoteSocket?.close());
 
-    return new Response(null, { status: 101, webSocket: clientWS });
+    return new Response(null, { status: 101, webSocket: clientWS, headers: debugHeaders() });
 }
 
 async function handleXhttp(request) {
     const vlessHeader = parseVLESSHeader(await request.arrayBuffer());
-    if (vlessHeader.hasError) return new Response(vlessHeader.message, { status: 400 });
+    if (vlessHeader.hasError) return new Response(vlessHeader.message, { status: 400, headers: debugHeaders() });
 
     const { addressRemote, portRemote, rawDataIndex, vlessVersion } = vlessHeader;
     const rawClientData = (await request.arrayBuffer()).slice(rawDataIndex);
@@ -349,9 +396,9 @@ async function handleXhttp(request) {
         await writer.write(rawClientData);
         writer.releaseLock();
 
-        return new Response(readable, { headers: { 'Content-Type': 'application/octet-stream' } });
+        return new Response(readable, { headers: debugHeaders({ 'Content-Type': 'application/octet-stream' }) });
     } catch (err) {
-        return new Response(`XHTTP connection failed: ${err.message}`, { status: 502 });
+        return new Response(`XHTTP connection failed: ${err.message}`, { status: 502, headers: debugHeaders() });
     }
 }
 
