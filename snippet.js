@@ -4,8 +4,6 @@ const EXTERNAL_SUB_BASE_URL = 'https://sub.kkii.eu.org';
 const FRONTEND_HTML_URL = 'https://appxzm.github.io/ui.html';
 const PROXY_IPS = ['proxyip.fxxk.dedyn.io'];
 const CONNECTION_TIMEOUT_MS = 5000;
-const ACCESS_LOG_ENDPOINT = 'https://your-domain/api/access_logs';  // 访问日志 API 地址
-const ACCESS_LOG_TOKEN = '';  // 访问日志 API 密钥
 
 import { connect } from 'cloudflare:sockets';
 
@@ -14,46 +12,6 @@ function connectWithTimeout(hostname, port) {
         connect({ hostname, port }),
         new Promise((_, reject) => setTimeout(() => reject(new Error('Connection timed out')), CONNECTION_TIMEOUT_MS))
     ]);
-}
-
-function getRequestClientIp(request) {
-    const directIp = request.headers.get('CF-Connecting-IP');
-    if (directIp) return directIp;
-    const forwardedFor = request.headers.get('X-Forwarded-For');
-    return forwardedFor ? forwardedFor.split(',')[0].trim() : '';
-}
-
-function sendAccessLog(request, eventType, ctx, extra = {}) {
-    if (!ACCESS_LOG_ENDPOINT || !ACCESS_LOG_TOKEN) return;
-    const url = new URL(request.url);
-    const payload = {
-        event_type: eventType,
-        client_ip: getRequestClientIp(request),
-        country: request.cf?.country || request.headers.get('CF-IPCountry') || '',
-        colo: request.cf?.colo || '',
-        host: url.hostname,
-        path: url.pathname,
-        method: request.method,
-        user_agent: request.headers.get('User-Agent') || '',
-        target: extra.target || '',
-        uuid: extra.uuid || ''
-    };
-    if (payload.uuid && !payload.target.includes('uuid=')) {
-        payload.target = payload.target ? `${payload.target} uuid=${payload.uuid}` : `uuid=${payload.uuid}`;
-    }
-
-    const task = fetch(ACCESS_LOG_ENDPOINT, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${ACCESS_LOG_TOKEN}`
-        },
-        body: JSON.stringify(payload)
-    }).catch(() => {});
-
-    if (ctx?.waitUntil) {
-        ctx.waitUntil(task);
-    }
 }
 
 async function handleAppDownloadRequest(request) {
@@ -81,14 +39,14 @@ async function handleAppDownloadRequest(request) {
 }
 
 export default {
-    async fetch(request, env, ctx) {
+    async fetch(request) {
         try {
             const url = new URL(request.url);
             const upgradeHeader = request.headers.get('Upgrade');
             
             if (upgradeHeader?.toLowerCase() !== 'websocket') {
                 if (request.method === 'POST') {
-                    return handleXhttp(request, ctx);
+                    return handleXhttp(request);
                 }
 
                 const pathname = url.pathname.toLowerCase();
@@ -97,7 +55,6 @@ export default {
 
                 if (pathname === '/') {
                     if (isClient) {
-                        sendAccessLog(request, 'snippet_subscription', ctx, { target: 'xray' });
                         const xrayUrl = `${EXTERNAL_SUB_BASE_URL}/x/${SUB_ID}`;
                         return fetch(xrayUrl, { headers: { 'User-Agent': userAgent } });
                     }
@@ -208,7 +165,6 @@ export default {
                 };
 
                 if (subMap[pathname]) {
-                    sendAccessLog(request, 'snippet_subscription', ctx, { target: pathname.slice(1) });
                     return fetch(subMap[pathname], { headers: { 'User-Agent': userAgent || 'Cloudflare-Worker-Proxy' } });
                 }
                 
@@ -277,7 +233,7 @@ export default {
                 enableGlobalSocks,
                 ProxyIP,
                 ProxyPort
-            }, ctx);
+            });
             
         } catch (err) {
             return new Response(err.stack || err.toString(), { status: 500 });
@@ -285,7 +241,7 @@ export default {
     },
 };
 
-async function handleSPESSWebSocket(request, config, ctx) {
+async function handleSPESSWebSocket(request, config) {
     const { parsedSocks5Address, enableSocks, enableGlobalSocks, ProxyIP, ProxyPort } = config;
     const [clientWS, serverWS] = Object.values(new WebSocketPair());
     serverWS.accept();
@@ -304,10 +260,9 @@ async function handleSPESSWebSocket(request, config, ctx) {
             const result = parseVLESSHeader(chunk);
             if (result.hasError) throw new Error(result.message);
 
-            const { addressRemote, portRemote, rawDataIndex, vlessVersion, isUDP, addressType, uuid } = result;
+            const { addressRemote, portRemote, rawDataIndex, vlessVersion, isUDP, addressType } = result;
             const rawClientData = chunk.slice(rawDataIndex);
             const vlessRespHeader = new Uint8Array([vlessVersion[0], 0]);
-            sendAccessLog(request, 'snippet_vless_ws', ctx, { target: `${addressRemote}:${portRemote}`, uuid });
 
             if (isUDP) {
                 if (portRemote === 53) return handleUDPOutBound(serverWS, vlessRespHeader, rawClientData);
@@ -359,15 +314,13 @@ async function handleSPESSWebSocket(request, config, ctx) {
     return new Response(null, { status: 101, webSocket: clientWS });
 }
 
-async function handleXhttp(request, ctx) {
-    const requestBody = await request.arrayBuffer();
-    const vlessHeader = parseVLESSHeader(requestBody);
+async function handleXhttp(request) {
+    const vlessHeader = parseVLESSHeader(await request.arrayBuffer());
     if (vlessHeader.hasError) return new Response(vlessHeader.message, { status: 400 });
 
-    const { addressRemote, portRemote, rawDataIndex, vlessVersion, uuid } = vlessHeader;
-    const rawClientData = requestBody.slice(rawDataIndex);
+    const { addressRemote, portRemote, rawDataIndex, vlessVersion } = vlessHeader;
+    const rawClientData = (await request.arrayBuffer()).slice(rawDataIndex);
     const vlessRespHeader = new Uint8Array([vlessVersion[0], 0]);
-    sendAccessLog(request, 'snippet_vless_xhttp', ctx, { target: `${addressRemote}:${portRemote}`, uuid });
 
     try {
         let remoteSocket;
@@ -454,7 +407,7 @@ function parseVLESSHeader(buffer) {
             break;
         default: return { hasError: true, message: 'invalid address type' };
     }
-    return { hasError: false, uuid, addressRemote: address, portRemote: port, rawDataIndex: offset, vlessVersion: version, isUDP, addressType };
+    return { hasError: false, addressRemote: address, portRemote: port, rawDataIndex: offset, vlessVersion: version, isUDP, addressType };
 }
 
 function pipeRemoteToWebSocket(remoteSocket, ws, vlessHeader, retry) {
