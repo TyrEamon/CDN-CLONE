@@ -16,6 +16,17 @@ const _du = (encodedStr) => {
         return encodedStr;
     }
 };
+const SITE_LOGO_PNG_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAMAAABEpIrGAAAALVBMVEVHcEz0wi30wi30wi30wi30wi30wi30wi30wi30wi30wi30wi30wi30wi30wi2HbsahAAAADnRSTlMAC9MaJ7jokPWlWkh3NK3xKBUAAADqSURBVDiNhZNZEgURDEUjtKnJ/pf7CPEMXSVfSo6bEcAwEwN6Io8hGjjNOEvDrNsR7Wgzpxc/7n4inIjXnv4S5x3vmx9DsafmKYRe9N3QC8L0KG7BGZGU+JFp50fNWT+dMENgA6SsImHsBKiUcgN1y8MaiDQDpdNdqgtHCBvAr2AoB8ADKJf12PJE8CdA6h/DA30AHCO18x24hrgmeZaJa5nXRq2tJttbrUarBeXZK5/bsHoGPO8+7iJWh9i3QjIzUzSvqwLvYZZ1cMvssThrCTnJDoueHhdV+Vza+9rfP87968H18zLy+f1/aOAeHd+g+hoAAAAASUVORK5CYII=';
+
+function getLogoResponse() {
+    const bytes = Uint8Array.from(atob(SITE_LOGO_PNG_BASE64), c => c.charCodeAt(0));
+    return new Response(bytes, {
+        headers: {
+            'Content-Type': 'image/png',
+            'Cache-Control': 'public, max-age=604800, immutable'
+        }
+    });
+}
 
 async function generateHash(content) {
     const data = new TextEncoder().encode(content);
@@ -42,6 +53,10 @@ export default {
       }
       
       const path = url.pathname;
+
+      if (path === '/favicon.ico' || path === '/favicon.png' || path === '/apple-touch-icon.png') {
+          return getLogoResponse();
+      }
 
       try {
           await initializeAndMigrateDatabase(env);
@@ -403,6 +418,8 @@ const expectedSchemas = {
       'event_type TEXT NOT NULL',
       'client_ip TEXT',
       'country TEXT',
+      'region TEXT',
+      'city TEXT',
       'colo TEXT',
       'host TEXT',
       'path TEXT',
@@ -599,6 +616,8 @@ function buildAccessLogEntry(request, eventType, extra = {}) {
       event_type: normalizeLogValue(extra.event_type || eventType, 64),
       client_ip: normalizeLogValue(extra.client_ip || getRequestClientIp(request), 128),
       country: normalizeLogValue(extra.country || request.cf?.country || request.headers.get('CF-IPCountry'), 32),
+      region: normalizeLogValue(extra.region || request.cf?.region, 128),
+      city: normalizeLogValue(extra.city || request.cf?.city, 128),
       colo: normalizeLogValue(extra.colo || request.cf?.colo, 32),
       host: normalizeLogValue(extra.host || url.hostname, 255),
       path: normalizeLogValue(extra.path || url.pathname, 255),
@@ -716,12 +735,14 @@ function decorateAccessLogRow(row) {
 
 async function insertAccessLog(db, entry) {
   await db.prepare(`
-      INSERT INTO access_logs (event_type, client_ip, country, colo, host, path, method, user_agent, target)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO access_logs (event_type, client_ip, country, region, city, colo, host, path, method, user_agent, target)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).bind(
       entry.event_type,
       entry.client_ip,
       entry.country,
+      entry.region,
+      entry.city,
       entry.colo,
       entry.host,
       entry.path,
@@ -763,7 +784,7 @@ async function apiGetAccessLogs(request, db) {
   const rawLimit = parseInt(url.searchParams.get('limit') || '100', 10);
   const limit = Math.min(Math.max(Number.isFinite(rawLimit) ? rawLimit : 100, 1), 500);
   const { results } = await db.prepare(`
-      SELECT id, event_type, client_ip, country, colo, host, path, method, user_agent, target,
+      SELECT id, event_type, client_ip, country, region, city, colo, host, path, method, user_agent, target,
              strftime('%Y-%m-%dT%H:%M:%SZ', created_at) as created_at
       FROM access_logs
       ORDER BY id DESC
@@ -801,18 +822,18 @@ async function apiGetAccessStats(request, db) {
   }
 
   const { results: topIps } = await db.prepare(`
-      SELECT client_ip, country, COUNT(*) as request_count, MAX(created_at) as last_seen
+      SELECT client_ip, country, region, city, MAX(colo) as colo, COUNT(*) as request_count, MAX(created_at) as last_seen
       FROM access_logs
       WHERE created_at >= datetime('now', '-7 days')
         AND event_type IN ${subscriptionEvents}
         AND client_ip != ''
-      GROUP BY client_ip, country
+      GROUP BY client_ip, country, region, city
       ORDER BY request_count DESC
       LIMIT 20
   `).all();
 
   const { results: recentLogs } = await db.prepare(`
-      SELECT id, event_type, client_ip, country, colo, host, path, method, user_agent, target,
+      SELECT id, event_type, client_ip, country, region, city, colo, host, path, method, user_agent, target,
              strftime('%Y-%m-%dT%H:%M:%SZ', created_at) as created_at
       FROM access_logs
       WHERE event_type IN ${subscriptionEvents}
@@ -1233,7 +1254,7 @@ async function handleUiRequest(request, env) {
 }
 
 function getHtmlLayout(title, content) { 
-  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>${title}</title><style>
+  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>${title}</title><link rel="icon" type="image/png" href="/favicon.png"><link rel="apple-touch-icon" href="/apple-touch-icon.png"><style>
 :root {
     --font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', 'Liberation Sans', sans-serif;
     --sidebar-width: 240px;
@@ -1479,6 +1500,8 @@ function getPublicHomepage(requestUrl, domains, ipSources, threeNetworkSourceNam
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>CF-DNS-Clone</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
   <style>
     :root {
       --bg-gradient: linear-gradient(135deg, #a8edea 0%, #fed6e3 100%);
@@ -2137,6 +2160,13 @@ function formatAccessTime(value) {
   return formatBeijingTime(normalized);
 }
 
+function renderAccessLocation(row, includeColo = true) {
+  const geoParts = [row.country, row.region, row.city].filter(Boolean).map(escapeHtml);
+  const geoText = geoParts.length > 0 ? geoParts.join(' / ') : '未知';
+  if (!includeColo || !row.colo) return geoText;
+  return geoText + '<br><small>边缘节点: ' + escapeHtml(row.colo) + '</small>';
+}
+
 function renderAccessStats(stats) {
   const summary = document.getElementById('access-stats-summary');
   const topIps = document.getElementById('access-top-ips');
@@ -2158,10 +2188,10 @@ function renderAccessStats(stats) {
       topIps.innerHTML = '<p>暂无订阅访问记录。用户重新拉订阅后，这里会开始出现数据。</p>';
   } else {
       topIps.innerHTML = '<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">' +
-        '<thead><tr><th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">IP</th><th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">国家</th><th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">请求数</th><th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">最后出现</th></tr></thead>' +
+        '<thead><tr><th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">IP</th><th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">位置</th><th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">请求数</th><th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">最后出现</th></tr></thead>' +
         '<tbody>' + rows.map(row => '<tr>' +
           '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));font-family:monospace;">' + escapeHtml(row.client_ip) + '</td>' +
-          '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">' + escapeHtml(row.country || '-') + '</td>' +
+          '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">' + renderAccessLocation(row) + '</td>' +
           '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">' + Number(row.request_count || 0) + '</td>' +
           '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">' + escapeHtml(formatAccessTime(row.last_seen)) + '</td>' +
         '</tr>').join('') + '</tbody></table></div>';
@@ -2186,7 +2216,7 @@ function renderAccessStats(stats) {
     '</tr></thead>' +
     '<tbody>' + logs.map(row => '<tr>' +
       '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));white-space:nowrap;">' + escapeHtml(formatAccessTime(row.created_at)) + '</td>' +
-      '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));font-family:monospace;white-space:nowrap;">' + escapeHtml(row.client_ip || '-') + '<br><small>' + escapeHtml(row.country || '-') + ' / ' + escapeHtml(row.colo || '-') + '</small></td>' +
+      '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));font-family:monospace;white-space:nowrap;">' + escapeHtml(row.client_ip || '-') + '<br><span style="font-size:.85em;">' + renderAccessLocation(row) + '</span></td>' +
       '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));white-space:nowrap;">' + escapeHtml(row.event_label || row.event_type) + '</td>' +
       '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));font-family:monospace;white-space:nowrap;">' + escapeHtml(row.target || row.path || '-') + '</td>' +
       '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));white-space:nowrap;">' + escapeHtml(row.device_type || '-') + '</td>' +
