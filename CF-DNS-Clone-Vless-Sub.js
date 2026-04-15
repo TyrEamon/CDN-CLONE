@@ -151,8 +151,9 @@ async function handleSubscriptionRequest(request, env, id, type, ctx) {
   }
   
   const url = new URL(request.url);
-  const nodeUrl = `${url.origin}/${id}`;
-  const targetUrl = `${sublinkWorkerUrl.replace(/\/$/, '')}/${type}?config=${encodeURIComponent(nodeUrl)}`;
+  const nodeUrl = new URL(`/${id}`, url.origin);
+  nodeUrl.searchParams.set('via', 'subscription_convert');
+  const targetUrl = `${sublinkWorkerUrl.replace(/\/$/, '')}/${type}?config=${encodeURIComponent(nodeUrl.toString())}`;
 
   try {
       const subResponse = await fetch(targetUrl, { headers: { 'User-Agent': request.headers.get('User-Agent') || 'CF-DNS-Clon/1.0' } });
@@ -165,7 +166,11 @@ async function handleSubscriptionRequest(request, env, id, type, ctx) {
 }
 
 async function handleNodeListRequest(request, env, id, ctx) {
-  queueAccessLog(env.WUYA, request, ctx, 'node_list', { target: id });
+  const requestUrl = new URL(request.url);
+  const eventType = requestUrl.searchParams.get('via') === 'subscription_convert'
+      ? 'subscription_backend_fetch'
+      : 'node_list';
+  queueAccessLog(env.WUYA, request, ctx, eventType, { target: id });
   try {
       const { results: domains } = await env.WUYA.prepare('SELECT id, target_domain, notes, is_single_resolve, single_resolve_limit, last_synced_records, single_resolve_node_names FROM domains WHERE is_enabled = 1 ORDER BY is_system DESC, id').all();
       const proxySettings = await getProxySettings(env.WUYA);
@@ -648,7 +653,8 @@ function parseUserAgentInfo(userAgent = '') {
       ['v2rayNG', /v2rayng/i],
       ['v2rayN', /v2rayn/i],
       ['NekoBox', /nekobox/i],
-      ['Karing', /karing/i]
+      ['Karing', /karing/i],
+      ['V2Box', /v2box/i]
   ];
   const browserChecks = [
       ['WeChat', /micromessenger/i],
@@ -671,7 +677,8 @@ function parseUserAgentInfo(userAgent = '') {
       'Loon': { osName: 'iOS', deviceType: '手机' },
       'v2rayNG': { osName: 'Android', deviceType: '手机' },
       'v2rayN': { osName: 'Windows', deviceType: '桌面' },
-      'NekoBox': { osName: 'Android', deviceType: '手机' }
+      'NekoBox': { osName: 'Android', deviceType: '手机' },
+      'V2Box': { osName: 'iOS', deviceType: '手机' }
   };
 
   let browserName = '未知';
@@ -700,14 +707,14 @@ function parseUserAgentInfo(userAgent = '') {
   let osName = '未知';
   if (/windows/i.test(ua)) osName = 'Windows';
   else if (/android/i.test(ua)) osName = 'Android';
-  else if (/iphone|ipad|ipod/i.test(ua)) osName = 'iOS';
+  else if (/iphone|ipad|ipod|\bios\b/i.test(ua)) osName = 'iOS';
   else if (/mac os x|macintosh/i.test(ua)) osName = 'macOS';
   else if (/linux/i.test(ua)) osName = 'Linux';
   if (osName === '未知' && clientHint?.osName) osName = clientHint.osName;
 
   let deviceType = '未知';
   if (/ipad|tablet/i.test(ua)) deviceType = '平板';
-  else if (/mobile|iphone|ipod|android/i.test(ua)) deviceType = '手机';
+  else if (/mobile|iphone|ipod|android|\bios\b/i.test(ua)) deviceType = '手机';
   else if (osName === 'Windows' || osName === 'macOS' || osName === 'Linux') deviceType = '桌面';
   if (deviceType === '未知' && clientHint?.deviceType) deviceType = clientHint.deviceType;
   else if (deviceType === '未知' && clientType === '订阅客户端') deviceType = '客户端';
@@ -728,6 +735,7 @@ function decorateAccessLogRow(row) {
   const eventLabels = {
       node_list: '拉取节点列表',
       subscription_convert: '拉取转换订阅',
+      subscription_backend_fetch: '转换器回源拉取',
       snippet_subscription: 'Snippet订阅',
       snippet_vless_ws: 'Snippet节点连接',
       snippet_vless_xhttp: 'Snippet XHTTP连接'
