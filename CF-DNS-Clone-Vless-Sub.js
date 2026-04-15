@@ -427,6 +427,12 @@ const expectedSchemas = {
       'user_agent TEXT',
       'target TEXT',
       'created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP'
+  ],
+  access_ip_whitelist: [
+      'client_ip TEXT PRIMARY KEY NOT NULL',
+      'label TEXT',
+      'created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+      'last_seen TIMESTAMP'
   ]
 };
 
@@ -750,6 +756,10 @@ async function insertAccessLog(db, entry) {
       entry.user_agent,
       entry.target
   ).run();
+  if (entry.client_ip) {
+      await db.prepare("UPDATE access_ip_whitelist SET last_seen = CURRENT_TIMESTAMP WHERE client_ip = ?")
+          .bind(entry.client_ip).run();
+  }
   await db.prepare("DELETE FROM access_logs WHERE id NOT IN (SELECT id FROM access_logs ORDER BY id DESC LIMIT 2000)").run();
 }
 
@@ -793,6 +803,36 @@ async function apiGetAccessLogs(request, db) {
   return jsonResponse((results || []).map(decorateAccessLogRow));
 }
 
+async function apiMarkAccessIp(request, db) {
+  const body = await request.json().catch(() => ({}));
+  const clientIp = normalizeLogValue(body.client_ip, 128);
+  const label = normalizeLogValue(body.label, 128) || null;
+
+  if (!clientIp) {
+      return jsonResponse({ error: '缺少 IP。' }, 400);
+  }
+
+  await db.prepare(`
+      INSERT INTO access_ip_whitelist (client_ip, label, last_seen)
+      VALUES (?, ?, (SELECT MAX(created_at) FROM access_logs WHERE client_ip = ?))
+      ON CONFLICT(client_ip) DO UPDATE SET
+        label = excluded.label,
+        last_seen = COALESCE(excluded.last_seen, access_ip_whitelist.last_seen)
+  `).bind(clientIp, label, clientIp).run();
+
+  return jsonResponse({ success: true, message: 'IP 已加入白名单。' });
+}
+
+async function apiUnmarkAccessIp(db, clientIp) {
+  const normalizedIp = normalizeLogValue(clientIp, 128);
+  if (!normalizedIp) {
+      return jsonResponse({ error: '缺少 IP。' }, 400);
+  }
+
+  await db.prepare("DELETE FROM access_ip_whitelist WHERE client_ip = ?").bind(normalizedIp).run();
+  return jsonResponse({ success: true, message: 'IP 已移出白名单。' });
+}
+
 async function apiGetAccessStats(request, db) {
   const windows = [
       { key: '24h', modifier: '-1 day' },
@@ -822,14 +862,90 @@ async function apiGetAccessStats(request, db) {
   }
 
   const { results: topIps } = await db.prepare(`
-      SELECT client_ip, country, region, city, MAX(colo) as colo, COUNT(*) as request_count, MAX(created_at) as last_seen
-      FROM access_logs
-      WHERE created_at >= datetime('now', '-7 days')
-        AND event_type IN ${subscriptionEvents}
-        AND client_ip != ''
-      GROUP BY client_ip, country, region, city
+      WITH subscription_logs AS (
+        SELECT *
+        FROM access_logs
+        WHERE created_at >= datetime('now', '-7 days')
+          AND event_type IN ${subscriptionEvents}
+          AND client_ip != ''
+      ),
+      ip_counts AS (
+        SELECT client_ip, COUNT(*) as request_count, MAX(created_at) as last_seen
+        FROM subscription_logs
+        GROUP BY client_ip
+      ),
+      latest_ids AS (
+        SELECT client_ip, MAX(id) as last_log_id
+        FROM subscription_logs
+        GROUP BY client_ip
+      )
+      SELECT c.client_ip, l.country, l.region, l.city, l.colo, c.request_count, c.last_seen,
+             w.label, strftime('%Y-%m-%dT%H:%M:%SZ', w.created_at) as marked_at,
+             CASE WHEN w.client_ip IS NULL THEN 0 ELSE 1 END as is_whitelisted
+      FROM ip_counts c
+      LEFT JOIN latest_ids li ON li.client_ip = c.client_ip
+      LEFT JOIN access_logs l ON l.id = li.last_log_id
+      LEFT JOIN access_ip_whitelist w ON w.client_ip = c.client_ip
       ORDER BY request_count DESC
       LIMIT 20
+  `).all();
+
+  const { results: newIps } = await db.prepare(`
+      WITH subscription_logs AS (
+        SELECT *
+        FROM access_logs
+        WHERE created_at >= datetime('now', '-30 days')
+          AND event_type IN ${subscriptionEvents}
+          AND client_ip != ''
+      ),
+      ip_counts AS (
+        SELECT client_ip, COUNT(*) as request_count, MAX(created_at) as last_seen
+        FROM subscription_logs
+        GROUP BY client_ip
+      ),
+      latest_ids AS (
+        SELECT client_ip, MAX(id) as last_log_id
+        FROM subscription_logs
+        GROUP BY client_ip
+      )
+      SELECT c.client_ip, l.country, l.region, l.city, l.colo, c.request_count, c.last_seen
+      FROM ip_counts c
+      LEFT JOIN latest_ids li ON li.client_ip = c.client_ip
+      LEFT JOIN access_logs l ON l.id = li.last_log_id
+      LEFT JOIN access_ip_whitelist w ON w.client_ip = c.client_ip
+      WHERE w.client_ip IS NULL
+      ORDER BY c.last_seen DESC
+      LIMIT 100
+  `).all();
+
+  const { results: whitelistedIps } = await db.prepare(`
+      WITH subscription_logs AS (
+        SELECT *
+        FROM access_logs
+        WHERE created_at >= datetime('now', '-30 days')
+          AND event_type IN ${subscriptionEvents}
+          AND client_ip != ''
+      ),
+      ip_counts AS (
+        SELECT client_ip, COUNT(*) as request_count, MAX(created_at) as last_seen
+        FROM subscription_logs
+        GROUP BY client_ip
+      ),
+      latest_ids AS (
+        SELECT client_ip, MAX(id) as last_log_id
+        FROM subscription_logs
+        GROUP BY client_ip
+      )
+      SELECT w.client_ip, w.label, strftime('%Y-%m-%dT%H:%M:%SZ', w.created_at) as marked_at,
+             COALESCE(c.request_count, 0) as request_count,
+             COALESCE(c.last_seen, w.last_seen) as last_seen,
+             l.country, l.region, l.city, l.colo
+      FROM access_ip_whitelist w
+      LEFT JOIN ip_counts c ON c.client_ip = w.client_ip
+      LEFT JOIN latest_ids li ON li.client_ip = w.client_ip
+      LEFT JOIN access_logs l ON l.id = li.last_log_id
+      ORDER BY COALESCE(c.last_seen, w.last_seen, w.created_at) DESC
+      LIMIT 200
   `).all();
 
   const { results: recentLogs } = await db.prepare(`
@@ -844,6 +960,8 @@ async function apiGetAccessStats(request, db) {
   return jsonResponse({
       windows: stats,
       topIps,
+      newIps,
+      whitelistedIps,
       recentLogs: (recentLogs || []).map(decorateAccessLogRow)
   });
 }
@@ -867,6 +985,9 @@ async function handleApiRequest(request, env) {
   if (method === 'POST' && path === '/api/logout') return await apiLogout(request, db);
   if (method === 'GET' && path === '/api/access_logs') return await apiGetAccessLogs(request, db);
   if (method === 'GET' && path === '/api/access_stats') return await apiGetAccessStats(request, db);
+  if (method === 'POST' && path === '/api/access_ip_whitelist') return await apiMarkAccessIp(request, db);
+  const accessIpWhitelistMatch = path.match(/^\/api\/access_ip_whitelist\/(.+)$/);
+  if (accessIpWhitelistMatch && method === 'DELETE') return await apiUnmarkAccessIp(db, decodeURIComponent(accessIpWhitelistMatch[1]));
   if (method === 'GET' && path === '/api/settings') return await apiGetSettings(request, db);
   if (method === 'POST' && path === '/api/settings') return await apiSetSettings(request, env);
   if (method === 'GET' && path === '/api/domains') return await apiGetDomains(request, db);
@@ -2003,8 +2124,20 @@ async function getDashboardPage(domains, ipSources, settings) {
             <div id="access-top-ips"></div>
           </article>
           <article>
-            <h3>最近拉订阅记录</h3>
-            <div id="access-recent-logs"></div>
+            <h3>新订阅 IP</h3>
+            <p>最近 30 天出现、但还没有被标记的订阅 IP 会先放在这里。</p>
+            <div id="access-new-ips"></div>
+          </article>
+          <article>
+            <h3>已标记白名单</h3>
+            <p>确认过的 IP 会收进这里，之后不会再出现在新订阅 IP 里。</p>
+            <div id="access-whitelist-ips"></div>
+          </article>
+          <article>
+            <details open>
+              <summary style="cursor:pointer;font-weight:700;font-size:1.1rem;">最近拉订阅记录</summary>
+              <div id="access-recent-logs" style="max-height:420px;overflow:auto;margin-top:1rem;border:1px solid rgb(var(--c-border));border-radius:0.5rem;"></div>
+            </details>
           </article>
       </div>
       <div id="page-settings" class="page">
@@ -2167,11 +2300,75 @@ function renderAccessLocation(row, includeColo = true) {
   return geoText + '<br><small>边缘节点: ' + escapeHtml(row.colo) + '</small>';
 }
 
+function renderAccessIpTable(rows, mode) {
+  const isWhitelist = mode === 'whitelist';
+  const emptyText = isWhitelist ? '暂无已标记 IP。' : '暂无新订阅 IP。';
+  if (!rows || rows.length === 0) return '<p>' + emptyText + '</p>';
+
+  return '<div style="overflow:auto;max-height:360px;"><table style="width:100%;border-collapse:collapse;">' +
+    '<thead><tr>' +
+      '<th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">IP</th>' +
+      '<th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">位置</th>' +
+      '<th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">请求数</th>' +
+      '<th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">最后出现</th>' +
+      '<th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">' + (isWhitelist ? '备注' : '状态') + '</th>' +
+      '<th style="text-align:left;padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">操作</th>' +
+    '</tr></thead>' +
+    '<tbody>' + rows.map(row => {
+      const ip = row.client_ip || '';
+      const action = isWhitelist
+        ? '<button class="contrast access-ip-unmark-btn" data-ip="' + escapeHtml(ip) + '">取消标记</button>'
+        : '<button class="outline access-ip-mark-btn" data-ip="' + escapeHtml(ip) + '">标记白名单</button>';
+      const note = isWhitelist
+        ? escapeHtml(row.label || '-') + '<br><small>标记于: ' + escapeHtml(formatAccessTime(row.marked_at)) + '</small>'
+        : '<span class="status-needs-push">新订阅 IP</span>';
+
+      return '<tr>' +
+        '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));font-family:monospace;white-space:nowrap;">' + escapeHtml(ip) + '</td>' +
+        '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">' + renderAccessLocation(row) + '</td>' +
+        '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">' + Number(row.request_count || 0) + '</td>' +
+        '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));white-space:nowrap;">' + escapeHtml(formatAccessTime(row.last_seen)) + '</td>' +
+        '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">' + note + '</td>' +
+        '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));white-space:nowrap;">' + action + '</td>' +
+      '</tr>';
+    }).join('') + '</tbody></table></div>';
+}
+
+async function markAccessIp(clientIp) {
+  const label = prompt('给这个 IP 加个备注（可留空）', '');
+  if (label === null) return;
+
+  try {
+      const result = await apiFetch('/api/access_ip_whitelist', {
+          method: 'POST',
+          body: JSON.stringify({ client_ip: clientIp, label })
+      });
+      showNotification(result.message || 'IP 已标记', 'success');
+      await refreshAccessStats();
+  } catch (e) {
+      showNotification('标记失败: ' + escapeHtml(e.message), 'error');
+  }
+}
+
+async function unmarkAccessIp(clientIp) {
+  if (!confirm('确定要取消这个 IP 的白名单标记吗？')) return;
+
+  try {
+      const result = await apiFetch('/api/access_ip_whitelist/' + encodeURIComponent(clientIp), { method: 'DELETE' });
+      showNotification(result.message || 'IP 已取消标记', 'success');
+      await refreshAccessStats();
+  } catch (e) {
+      showNotification('取消标记失败: ' + escapeHtml(e.message), 'error');
+  }
+}
+
 function renderAccessStats(stats) {
   const summary = document.getElementById('access-stats-summary');
   const topIps = document.getElementById('access-top-ips');
+  const newIps = document.getElementById('access-new-ips');
+  const whitelistIps = document.getElementById('access-whitelist-ips');
   const recentLogs = document.getElementById('access-recent-logs');
-  if (!summary || !topIps || !recentLogs) return;
+  if (!summary || !topIps || !newIps || !whitelistIps || !recentLogs) return;
 
   const windows = stats.windows || {};
   const labels = { '24h': '最近 24 小时', '7d': '最近 7 天', '30d': '最近 30 天' };
@@ -2196,6 +2393,9 @@ function renderAccessStats(stats) {
           '<td style="padding:.75rem;border-bottom:1px solid rgb(var(--c-border));">' + escapeHtml(formatAccessTime(row.last_seen)) + '</td>' +
         '</tr>').join('') + '</tbody></table></div>';
   }
+
+  newIps.innerHTML = renderAccessIpTable(stats.newIps || [], 'new');
+  whitelistIps.innerHTML = renderAccessIpTable(stats.whitelistedIps || [], 'whitelist');
 
   const logs = stats.recentLogs || [];
   if (logs.length === 0) {
@@ -2229,9 +2429,13 @@ function renderAccessStats(stats) {
 async function refreshAccessStats() {
   const summary = document.getElementById('access-stats-summary');
   const topIps = document.getElementById('access-top-ips');
+  const newIps = document.getElementById('access-new-ips');
+  const whitelistIps = document.getElementById('access-whitelist-ips');
   const recentLogs = document.getElementById('access-recent-logs');
   if (summary) summary.innerHTML = '<p>正在加载访问统计...</p>';
   if (topIps) topIps.innerHTML = '';
+  if (newIps) newIps.innerHTML = '';
+  if (whitelistIps) whitelistIps.innerHTML = '';
   if (recentLogs) recentLogs.innerHTML = '';
   try {
       const stats = await apiFetch('/api/access_stats');
@@ -2998,6 +3202,17 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   document.getElementById('settingsForm').addEventListener('submit', saveSettings);
   document.getElementById('refreshAccessStatsBtn')?.addEventListener('click', refreshAccessStats);
+  document.getElementById('page-access-stats')?.addEventListener('click', (e) => {
+      const markBtn = e.target.closest('.access-ip-mark-btn');
+      if (markBtn) {
+          markAccessIp(markBtn.dataset.ip);
+          return;
+      }
+      const unmarkBtn = e.target.closest('.access-ip-unmark-btn');
+      if (unmarkBtn) {
+          unmarkAccessIp(unmarkBtn.dataset.ip);
+      }
+  });
   document.getElementById('addDomainBtn').addEventListener('click', () => openModal('domainModal'));
   document.getElementById('manualSyncBtn').addEventListener('click', (e) => handleStreamingRequest('/api/sync', e.target, document.getElementById('logOutput')));
   document.getElementById('domainForm').addEventListener('submit', (e) => { e.preventDefault(); saveDomain(); });
