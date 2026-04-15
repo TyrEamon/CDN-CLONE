@@ -849,6 +849,10 @@ async function apiGetAccessStats(request, db) {
   ];
   const stats = {};
   const subscriptionEvents = "('node_list','subscription_convert')";
+  const visibleSubscriptionLogWhere = `
+          event_type IN ${subscriptionEvents}
+          AND NOT (event_type = 'node_list' AND lower(COALESCE(user_agent, '')) LIKE 'curl/%')
+  `;
 
   for (const window of windows) {
       const row = await db.prepare(`
@@ -859,7 +863,7 @@ async function apiGetAccessStats(request, db) {
               COUNT(DISTINCT client_ip) as subscription_ips
           FROM access_logs
           WHERE created_at >= datetime('now', ?)
-            AND event_type IN ${subscriptionEvents}
+            AND ${visibleSubscriptionLogWhere}
       `).bind(window.modifier).first();
       stats[window.key] = row || {
           request_count: 0,
@@ -874,7 +878,7 @@ async function apiGetAccessStats(request, db) {
         SELECT *
         FROM access_logs
         WHERE created_at >= datetime('now', '-7 days')
-          AND event_type IN ${subscriptionEvents}
+          AND ${visibleSubscriptionLogWhere}
           AND client_ip != ''
       ),
       ip_counts AS (
@@ -903,7 +907,7 @@ async function apiGetAccessStats(request, db) {
         SELECT *
         FROM access_logs
         WHERE created_at >= datetime('now', '-30 days')
-          AND event_type IN ${subscriptionEvents}
+          AND ${visibleSubscriptionLogWhere}
           AND client_ip != ''
       ),
       ip_counts AS (
@@ -931,7 +935,7 @@ async function apiGetAccessStats(request, db) {
         SELECT *
         FROM access_logs
         WHERE created_at >= datetime('now', '-30 days')
-          AND event_type IN ${subscriptionEvents}
+          AND ${visibleSubscriptionLogWhere}
           AND client_ip != ''
       ),
       ip_counts AS (
@@ -960,7 +964,7 @@ async function apiGetAccessStats(request, db) {
       SELECT id, event_type, client_ip, country, region, city, colo, host, path, method, user_agent, target,
              strftime('%Y-%m-%dT%H:%M:%SZ', created_at) as created_at
       FROM access_logs
-      WHERE event_type IN ${subscriptionEvents}
+      WHERE ${visibleSubscriptionLogWhere}
       ORDER BY id DESC
       LIMIT 100
   `).all();
